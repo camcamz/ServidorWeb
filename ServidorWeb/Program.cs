@@ -1,75 +1,56 @@
-﻿// Importar espacios de nombres necesarios para red, entrada/salida, compresión y tareas asíncronas
-using System;
+﻿using System;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.IO;
 using System.Text.Json;
 using System.IO.Compression;
-using System.Threading.Tasks; // Para ejecución concurrente
+using System.Threading.Tasks;
 
-// Clase para deserializar la configuración del archivo config.json
+// Clase para deserializar la configuración desde config.json
 class Config
 {
-    // Puerto donde escuchará el servidor
-    public int port { get; set; }
-    // Carpeta raíz desde donde se servirán los archivos web
-    public string webRoot { get; set; }
+    public int Port { get; set; }
+    public required string webRoot { get; set; }
 }
 
 class Program
 {
     static void Main()
     {
-        // 1. Leer configuración desde config.json para obtener puerto y carpeta raíz
+        // Leer configuración desde archivo externo
         Config config;
         try
         {
             config = JsonSerializer.Deserialize<Config>(File.ReadAllText("config.json"));
         }
-        catch (FileNotFoundException)
+        catch
         {
-            Console.WriteLine("Error: El archivo config.json no se encontró.");
-            return; // Terminar si no existe configuración
-        }
-        catch (JsonException ex)
-        {
-            Console.WriteLine($"Error en config.json: {ex.Message}");
-            return; // Terminar si config.json está mal formado
-        }
-
-        int port = config.port;
-        string webRoot = config.webRoot;
-
-        // 2. Crear carpeta para logs si no existe
-        Directory.CreateDirectory("logs");
-
-        // 3. Verificar que la carpeta raíz exista
-        if (!Directory.Exists(webRoot))
-        {
-            Console.WriteLine($"Error: carpeta '{webRoot}' no existe.");
+            Console.WriteLine("Error al leer config.json");
             return;
         }
 
-        // 4. Crear archivos HTML por defecto (index.html y 404.html) si no existen
-        if (!File.Exists(Path.Combine(webRoot, "404.html")))
+        int port = config.Port;
+        string webRoot = config.webRoot;
+
+        // Verificar que la carpeta de archivos exista
+        if (!Directory.Exists(webRoot))
         {
-            File.WriteAllText(Path.Combine(webRoot, "404.html"),
-                "<!DOCTYPE html><html><head><title>404</title></head><body><h1>Error 404</h1><p>No encontrado.</p></body></html>");
+            Console.WriteLine($"La carpeta {webRoot} no existe.");
+            return;
         }
 
-        if (!File.Exists(Path.Combine(webRoot, "index.html")))
-        {
-            File.WriteAllText(Path.Combine(webRoot, "index.html"),
-                "<!DOCTYPE html><html><head><title>Bienvenido</title></head><body><h1>Servidor C#</h1><p>Inicio.</p></body></html>");
-        }
+        Directory.CreateDirectory("logs"); // Crear carpeta de logs si no existe
 
-        // 5. Iniciar servidor TCP escuchando en el puerto configurado
-        TcpListener server = new TcpListener(IPAddress.Any, port);
+        // Crear socket de servidor en puerto especificado
+        var ipEndPoint = new IPEndPoint(IPAddress.Any, port);
+        var serverSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+
         try
         {
-            server.Start();
-            Console.WriteLine($"Servidor escuchando en puerto {port}, sirviendo desde '{webRoot}'...");
+            serverSocket.Bind(ipEndPoint);
+            serverSocket.Listen(100); // Cola de hasta 100 conexiones pendientes
+            Console.WriteLine($"Servidor escuchando en el puerto {port}, sirviendo desde '{webRoot}'...");
         }
         catch (SocketException ex)
         {
@@ -77,38 +58,32 @@ class Program
             return;
         }
 
-        // 6. Bucle infinito para aceptar conexiones y manejarlas concurrentemente
+        // Bucle principal: aceptar clientes continuamente
         while (true)
         {
-            try
-            {
-                var client = server.AcceptTcpClient();
-                // Atender cada cliente en una tarea separada para concurrencia
-                _ = Task.Run(() => ManejarCliente(client, webRoot));
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error al aceptar cliente: {ex.Message}");
-            }
+            Socket clientSocket = serverSocket.Accept(); // Bloquea hasta que llegue una conexión
+            _ = Task.Run(() => ManejarCliente(clientSocket, webRoot)); // Maneja cada cliente en una tarea aparte (concurrencia)
         }
     }
 
-    // Método que maneja una conexión cliente y procesa la solicitud HTTP
-    static async Task ManejarCliente(TcpClient client, string webRoot)
+    // Función que maneja cada cliente
+    static async Task ManejarCliente(Socket socket, string webRoot)
     {
-        string ipCliente = ((IPEndPoint)client.Client.RemoteEndPoint!).Address.ToString();
+        string ipCliente = ((IPEndPoint)socket.RemoteEndPoint!).Address.ToString();
 
         try
         {
-            using var stream = client.GetStream();
-            using var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
-            using var writer = new StreamWriter(stream, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
+            var buffer = new byte[8192];
+            int recibido = await socket.ReceiveAsync(buffer, SocketFlags.None);
+            if (recibido == 0) return;
 
-            // Leer línea de solicitud HTTP (ejemplo: GET /index.html HTTP/1.1)
-            string? requestLine = await reader.ReadLineAsync();
+            string request = Encoding.UTF8.GetString(buffer, 0, recibido);
+            using var reader = new StringReader(request);
+
+            // Leer la primera línea de la solicitud HTTP (ej: GET /index.html HTTP/1.1)
+            string? requestLine = reader.ReadLine();
             if (string.IsNullOrEmpty(requestLine)) return;
 
-            // Parsear método, ruta y versión de la solicitud
             string metodo, ruta, version;
             try
             {
@@ -119,40 +94,31 @@ class Program
             }
             catch
             {
-                Console.WriteLine($"Solicitud inválida de {ipCliente}: {requestLine}");
-                return;
+                return; // Si la solicitud está mal formada, se ignora
             }
 
-            // Leer encabezados HTTP
-            string? lineaHeader;
+            // Leer headers
+            string? linea;
             int contentLength = 0;
             bool acceptGzip = false;
-
-            while (!string.IsNullOrEmpty(lineaHeader = await reader.ReadLineAsync()))
+            while (!string.IsNullOrEmpty(linea = reader.ReadLine()))
             {
-                if (lineaHeader.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
-                {
-                    int.TryParse(lineaHeader.Split(':')[1].Trim(), out contentLength);
-                }
-                else if (lineaHeader.StartsWith("Accept-Encoding:", StringComparison.OrdinalIgnoreCase))
-                {
-                    if (lineaHeader.Contains("gzip", StringComparison.OrdinalIgnoreCase))
-                    {
-                        acceptGzip = true;
-                    }
-                }
+                if (linea.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
+                    int.TryParse(linea.Split(':')[1].Trim(), out contentLength);
+                else if (linea.StartsWith("Accept-Encoding:", StringComparison.OrdinalIgnoreCase) && linea.Contains("gzip"))
+                    acceptGzip = true;
             }
 
             // Leer cuerpo en caso de POST
             string body = "";
             if (metodo == "POST" && contentLength > 0)
             {
-                char[] buffer = new char[contentLength];
-                await reader.ReadBlockAsync(buffer, 0, contentLength);
-                body = new string(buffer);
+                char[] cuerpo = new char[contentLength];
+                await reader.ReadBlockAsync(cuerpo, 0, contentLength);
+                body = new string(cuerpo);
             }
 
-            // Separar ruta y parámetros de consulta si existen
+            // Separar parámetros de consulta (si existen)
             string queryParams = "";
             string path = ruta;
             if (ruta.Contains("?"))
@@ -162,93 +128,72 @@ class Program
                 queryParams = partes[1];
             }
 
+            // Determinar qué archivo se está solicitando
             string archivoSolicitado = path == "/" ? "index.html" : path.TrimStart('/');
             string archivoCompleto = Path.Combine(webRoot, archivoSolicitado);
 
             string status, tipoContenido;
             byte[] datosRespuesta;
 
-            // Verificar si el archivo existe para devolverlo
             if (File.Exists(archivoCompleto))
             {
+                // Si el archivo existe, leerlo y preparar respuesta 200 OK
                 status = "200 OK";
                 tipoContenido = ObtenerTipoContenido(archivoSolicitado);
                 string contenido = await File.ReadAllTextAsync(archivoCompleto);
-
-                // Comprimir con gzip si el cliente lo acepta
-                if (acceptGzip)
-                {
-                    byte[] sinComprimir = Encoding.UTF8.GetBytes(contenido);
-                    using var mem = new MemoryStream();
-                    using (var gzip = new GZipStream(mem, CompressionLevel.Fastest, true))
-                    {
-                        await gzip.WriteAsync(sinComprimir, 0, sinComprimir.Length);
-                    }
-                    datosRespuesta = mem.ToArray();
-                }
-                else
-                {
-                    datosRespuesta = Encoding.UTF8.GetBytes(contenido);
-                }
+                datosRespuesta = ComprimirSiEsNecesario(contenido, acceptGzip);
             }
             else
             {
-                // Si no existe, devolver 404 personalizado
+                // Si no existe, enviar 404 y cargar archivo 404.html personalizado
                 status = "404 Not Found";
                 tipoContenido = "text/html";
                 string contenido404 = await File.ReadAllTextAsync(Path.Combine(webRoot, "404.html"));
-
-                if (acceptGzip)
-                {
-                    byte[] sinComprimir = Encoding.UTF8.GetBytes(contenido404);
-                    using var mem = new MemoryStream();
-                    using (var gzip = new GZipStream(mem, CompressionLevel.Fastest, true))
-                    {
-                        await gzip.WriteAsync(sinComprimir, 0, sinComprimir.Length);
-                    }
-                    datosRespuesta = mem.ToArray();
-                }
-                else
-                {
-                    datosRespuesta = Encoding.UTF8.GetBytes(contenido404);
-                }
+                datosRespuesta = ComprimirSiEsNecesario(contenido404, acceptGzip);
             }
 
-            // Construir encabezados HTTP de respuesta
-            var responseHeaders = new StringBuilder();
-            responseHeaders.Append($"HTTP/1.1 {status}\r\n");
-            responseHeaders.Append($"Content-Type: {tipoContenido}\r\n");
-            if (acceptGzip)
-                responseHeaders.Append("Content-Encoding: gzip\r\n");
-            responseHeaders.Append($"Content-Length: {datosRespuesta.Length}\r\n");
-            responseHeaders.Append("\r\n"); // Línea en blanco que separa encabezados del cuerpo
+            // Construir headers de respuesta
+            var headers = new StringBuilder();
+            headers.AppendLine($"HTTP/1.1 {status}");
+            headers.AppendLine($"Content-Type: {tipoContenido}");
+            if (acceptGzip) headers.AppendLine("Content-Encoding: gzip");
+            headers.AppendLine($"Content-Length: {datosRespuesta.Length}");
+            headers.AppendLine("Connection: close");
+            headers.AppendLine();
 
-            // Enviar encabezados y cuerpo
-            await writer.WriteAsync(responseHeaders.ToString());
-            await stream.WriteAsync(datosRespuesta, 0, datosRespuesta.Length);
+            // Enviar headers y luego el contenido
+            byte[] headersBytes = Encoding.UTF8.GetBytes(headers.ToString());
+            await socket.SendAsync(headersBytes);
+            await socket.SendAsync(datosRespuesta);
 
-            // Registrar petición en logs con información completa
+            // Registrar solicitud en logs
             Loguear(ipCliente, metodo, archivoSolicitado, queryParams, body);
-        }
-        catch (IOException ex)
-        {
-            Console.WriteLine($"E/S con cliente {ipCliente}: {ex.Message}");
-            if (ex.InnerException is SocketException inner)
-            {
-                Console.WriteLine($"  SocketException: {inner.Message}");
-            }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error inesperado con cliente {ipCliente}: {ex.Message}");
+            Console.WriteLine($"Error con cliente {ipCliente}: {ex.Message}");
         }
         finally
         {
-            client.Close(); // Cerrar conexión con cliente
+            socket.Close(); // Cerrar la conexión al terminar
         }
     }
 
-    // Método para obtener el tipo MIME basado en la extensión del archivo
+    // Devuelve los bytes comprimidos si el cliente lo permite
+    static byte[] ComprimirSiEsNecesario(string contenido, bool usarGzip)
+    {
+        byte[] bytes = Encoding.UTF8.GetBytes(contenido);
+        if (!usarGzip) return bytes;
+
+        using var mem = new MemoryStream();
+        using (var gzip = new GZipStream(mem, CompressionLevel.Fastest, true))
+        {
+            gzip.Write(bytes, 0, bytes.Length);
+        }
+        return mem.ToArray();
+    }
+
+    // Devuelve el tipo MIME del archivo solicitado
     static string ObtenerTipoContenido(string archivo)
     {
         string ext = Path.GetExtension(archivo).ToLower();
@@ -272,7 +217,7 @@ class Program
         };
     }
 
-    // Método para escribir registros de acceso con detalles en archivos diarios de logs
+    // Guarda los datos de cada solicitud en un archivo de log diario
     static void Loguear(string ip, string metodo, string archivo, string query, string body)
     {
         string fecha = DateTime.Now.ToString("yyyy-MM-dd");
